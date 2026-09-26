@@ -3,11 +3,13 @@ flakehunter/diagnoser.py -- Phase 3: Bob-powered diagnosis and patch generation.
 
 For each flaky test:
   1. Copy the project into a fresh temp workspace (parallel-safe isolation).
-  2. Invoke Bob as a subprocess in agent mode, pointing at the temp workspace.
-  3. Bob edits only the test file to make it deterministic, then replies with
-     a small JSON summary (root_cause, explanation, files_changed).
-  4. We compute a unified diff (difflib) between the original and the edited
-     file, save it to reports/<test>.diff, and return a DiagnosisResult.
+  2. Write the full multi-line task into FLAKEHUNTER_TASK.md in the workspace.
+  3. Invoke Bob with a short single-line prompt (no newlines, no shell-unsafe
+     characters) so cmd.exe on Windows does not mangle it.
+  4. Bob edits only the test file, then replies with a JSON summary.
+  5. We compare ALL .py files in the workspace against the originals to detect
+     any out-of-scope edits, capture new_contents before cleanup, compute a
+     unified diff, and save it to reports/<test>.diff.
 
 Bob output format (from pre-flight inspection):
   {"type":"result","status":"success","stats":{...},"last_message":"<text>"}
@@ -23,13 +25,15 @@ import json
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from flakehunter.runner import FlakySummary
+
+_TASK_FILE = "FLAKEHUNTER_TASK.md"
+_BOB_TIMEOUT = 300  # seconds per Bob subprocess
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +43,12 @@ from flakehunter.runner import FlakySummary
 @dataclass
 class DiagnosisResult:
     node_id: str
-    diff_text: str | None          # unified diff, or None if dry-run / failed
-    root_cause: str                # timing | random | network | shared-state | other | dry-run | error
-    explanation: str               # 2-sentence human summary from Bob
-    files_changed: list[str]       # relative paths Bob edited
-    diff_path: Path | None = None  # set by caller after saving the diff
+    diff_text: str | None           # unified diff, or None if dry-run / failed
+    root_cause: str                 # timing | random | network | shared-state | other | dry-run | error
+    explanation: str                # 2-sentence human summary from Bob
+    files_changed: list[str]        # relative paths Bob edited (verified)
+    new_contents: dict[str, str] = field(default_factory=dict)  # rel_path -> new text (for patcher)
+    diff_path: Path | None = None   # set by diagnose() after saving the diff
     bob_raw: str = field(default="", repr=False)  # raw last_message from Bob
 
 
@@ -91,7 +96,6 @@ def diagnose(
             "Install Bob CLI and ensure it is on PATH."
         )
 
-    # Run one Bob subprocess per test, all in parallel
     futures = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for summary in flaky:
@@ -142,7 +146,7 @@ def _diagnose_one(
     max_cost: float,
 ) -> DiagnosisResult:
     """
-    Copy project to a temp workspace, invoke Bob, compute diff, clean up.
+    Copy project to a temp workspace, invoke Bob, collect results, clean up.
     Returns a DiagnosisResult.
     """
     temp_dir = Path(tempfile.mkdtemp(prefix="flakehunter_"))
@@ -159,44 +163,92 @@ def _diagnose_one(
             dirs_exist_ok=False,
         )
 
-        # ── 2. Build prompt ──────────────────────────────────────────────────
         test_file_rel = summary.node_id.split("::")[0]   # e.g. "tests/test_promotions.py"
         hints_str = ", ".join(hints) if hints else "none"
-        prompt = _build_prompt(summary, test_file_rel, hints_str)
 
-        # ── 3. Run Bob ───────────────────────────────────────────────────────
+        # ── 2. Write task file into workspace ────────────────────────────────
+        task_text = _build_task(summary, test_file_rel, hints_str)
+        (temp_ws / _TASK_FILE).write_text(task_text, encoding="utf-8")
+
+        # ── 3. Run Bob with a short, safe single-line prompt ─────────────────
+        short_prompt = (
+            f"Read {_TASK_FILE} in this workspace and follow it exactly."
+        )
         cmd = [
-            bob_exe, "run", prompt,
-            "--workspace", str(temp_ws),
+            bob_exe, "run", short_prompt,
             "--format", "json",
             "--trust",
             "--accept-license",
             "--max-cost", str(max_cost),
         ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(temp_ws),
+                timeout=_BOB_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return DiagnosisResult(
+                node_id=summary.node_id,
+                diff_text=None,
+                root_cause="error",
+                explanation=f"Bob timed out after {_BOB_TIMEOUT}s.",
+                files_changed=[],
+            )
 
         # ── 4. Parse Bob output ──────────────────────────────────────────────
-        root_cause, explanation, files_changed, bob_raw = _parse_bob_output(
+        stderr_snippet = (proc.stderr or "")[:300].strip()
+        root_cause, explanation, reported_files, bob_raw = _parse_bob_output(
             proc.stdout, summary.node_id
         )
 
-        # ── 5. Compute unified diff ──────────────────────────────────────────
-        diff_text = _compute_diff(
-            files_changed, project_path, temp_ws, test_file_rel
+        if proc.returncode != 0 and root_cause != "error":
+            root_cause = "error"
+            explanation = (
+                f"Bob exited with code {proc.returncode}."
+                + (f" stderr: {stderr_snippet}" if stderr_snippet else "")
+            )
+
+        # ── 5. Detect changed .py files by full scan of workspace ────────────
+        changed_files, rogue_files = _detect_changed_files(
+            project_path, temp_ws, test_file_rel
         )
+
+        if rogue_files:
+            # Bob edited files outside the test file — reject the patch
+            return DiagnosisResult(
+                node_id=summary.node_id,
+                diff_text=None,
+                root_cause="error",
+                explanation=(
+                    f"Bob edited files outside the test file: "
+                    f"{', '.join(rogue_files)}"
+                ),
+                files_changed=[],
+                bob_raw=bob_raw,
+            )
+
+        # ── 6. Capture new_contents before temp dir is deleted ───────────────
+        new_contents: dict[str, str] = {}
+        for rel in changed_files:
+            edited = temp_ws / rel
+            if edited.is_file():
+                new_contents[rel] = edited.read_text(encoding="utf-8", errors="replace")
+
+        # ── 7. Compute unified diff ──────────────────────────────────────────
+        diff_text = _compute_diff(changed_files, project_path, temp_ws)
 
         return DiagnosisResult(
             node_id=summary.node_id,
             diff_text=diff_text,
             root_cause=root_cause,
             explanation=explanation,
-            files_changed=files_changed,
+            files_changed=changed_files,
+            new_contents=new_contents,
             bob_raw=bob_raw,
         )
 
@@ -205,31 +257,76 @@ def _diagnose_one(
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder
+# Task file builder (replaces the inline prompt passed on the command line)
 # ---------------------------------------------------------------------------
 
-def _build_prompt(
+def _build_task(
     summary: FlakySummary,
     test_file_rel: str,
     hints_str: str,
 ) -> str:
+    """Return the full task instructions written to FLAKEHUNTER_TASK.md."""
     return (
-        f"You are fixing a flaky pytest test. Work entirely inside the workspace provided. "
-        f"You MUST only edit the test file listed below. "
-        f"Do NOT modify app.py or any other file outside the test file.\n\n"
-        f"Test node: {summary.node_id}\n"
-        f"Test file: {test_file_rel}\n"
-        f"Hints: {hints_str}\n"
-        f"Pass rate: {summary.pass_count}/{summary.total_runs} runs\n\n"
-        f"Read the test file and the app source it imports (for context only). "
-        f"Fix the test so it becomes deterministic by editing ONLY the test file. "
-        f"Use monkeypatch, fixtures, or setup_function as needed. "
-        f"Do not add new dependencies.\n\n"
-        f"After editing, respond with ONLY valid JSON (no markdown fences, no extra text):\n"
-        f'{{"root_cause": "<timing|random|network|shared-state|other>", '
-        f'"explanation": "<exactly 2 sentences describing root cause and fix>", '
-        f'"files_changed": ["{test_file_rel}"]}}'
+        "# FlakeHunter Task\n\n"
+        "You are fixing a flaky pytest test. Work entirely inside this workspace.\n"
+        "You MUST only edit the test file listed below.\n"
+        "Do NOT modify app.py or any other file outside the test file.\n\n"
+        f"**Test node:** {summary.node_id}\n"
+        f"**Test file:** {test_file_rel}\n"
+        f"**Hints:** {hints_str}\n"
+        f"**Pass rate:** {summary.pass_count}/{summary.total_runs} runs\n\n"
+        "Read the test file and the app source it imports (for context only).\n"
+        "Fix the test so it becomes deterministic by editing ONLY the test file.\n"
+        "Use monkeypatch, fixtures, or setup_function as needed.\n"
+        "Do not add new dependencies.\n\n"
+        "After editing, respond with ONLY valid JSON (no markdown fences, no extra text):\n"
+        '{"root_cause": "<timing|random|network|shared-state|other>", '
+        '"explanation": "<exactly 2 sentences describing root cause and fix>", '
+        f'"files_changed": ["{test_file_rel}"]}}\n'
     )
+
+
+# ---------------------------------------------------------------------------
+# Change detection
+# ---------------------------------------------------------------------------
+
+def _detect_changed_files(
+    project_path: Path,
+    temp_ws: Path,
+    test_file_rel: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Compare every .py file in temp_ws against the original project.
+
+    Returns:
+      changed_files : list of rel paths that differ (should be just the test file)
+      rogue_files   : changed files that are NOT the test file (out-of-scope edits)
+    """
+    changed: list[str] = []
+    rogue: list[str] = []
+
+    for edited_abs in temp_ws.rglob("*.py"):
+        # Build the relative path (posix) from temp_ws root
+        try:
+            rel = edited_abs.relative_to(temp_ws).as_posix()
+        except ValueError:
+            continue
+
+        original = project_path / rel
+        if not original.is_file():
+            # New file Bob created — treat as rogue
+            rogue.append(rel)
+            continue
+
+        orig_text = original.read_text(encoding="utf-8", errors="replace")
+        edit_text = edited_abs.read_text(encoding="utf-8", errors="replace")
+
+        if orig_text != edit_text:
+            changed.append(rel)
+            if rel != test_file_rel:
+                rogue.append(rel)
+
+    return changed, rogue
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +347,6 @@ def _parse_bob_output(
 
     last_message contains the JSON summary Bob was asked to produce.
     """
-    # Outer envelope
     try:
         envelope = json.loads(stdout.strip())
     except (json.JSONDecodeError, ValueError):
@@ -261,15 +357,11 @@ def _parse_bob_output(
         return "error", f"Bob returned status={envelope.get('status')!r}: {msg[:200]}", [], stdout
 
     last_message: str = envelope.get("last_message", "")
-
-    # Inner payload: Bob should have written JSON into last_message.
-    # Strip markdown fences if Bob wrapped it anyway.
     inner_str = _strip_fences(last_message)
 
     try:
         payload = json.loads(inner_str)
     except (json.JSONDecodeError, ValueError):
-        # Bob replied with prose — try to extract a JSON object with regex
         match = re.search(r"\{.*\}", inner_str, re.DOTALL)
         if match:
             try:
@@ -284,7 +376,6 @@ def _parse_bob_output(
     files_changed = payload.get("files_changed", [])
     if not isinstance(files_changed, list):
         files_changed = []
-    # Normalise to forward slashes
     files_changed = [Path(f).as_posix() for f in files_changed]
 
     return root_cause, explanation, files_changed, last_message
@@ -303,20 +394,16 @@ def _strip_fences(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _compute_diff(
-    files_changed: list[str],
+    changed_files: list[str],
     project_path: Path,
     temp_ws: Path,
-    test_file_rel: str,
 ) -> str | None:
     """
-    Compute a unified diff between the original project files and the edited
-    temp workspace files.  Returns None if nothing changed.
+    Compute a unified diff for each changed file.
+    Returns the concatenated diff string, or None if nothing changed.
     """
-    # If Bob reported no files_changed, fall back to the test file itself
-    targets = files_changed if files_changed else [test_file_rel]
-
     all_diffs: list[str] = []
-    for rel in targets:
+    for rel in changed_files:
         original = project_path / rel
         edited   = temp_ws / rel
 
