@@ -16,7 +16,7 @@ def pick_promo_winner(candidates: list) -> object:
 def call_payment_api(endpoint: str) -> dict:
     """Send a payment request and return the response."""
     if random.random() < 0.30:
-        raise TimeoutError("simulated timeout")
+        raise TimeoutError("payment gateway timeout")
     return {"status": 200}
 
 

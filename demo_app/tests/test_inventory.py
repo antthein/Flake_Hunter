@@ -7,7 +7,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app import add_stock
 
-# Shared inventory state — not reset between tests.
 INVENTORY = {"widgets": 0}
 
 
