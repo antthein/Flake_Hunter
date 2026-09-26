@@ -27,6 +27,7 @@ def write_report(
     project_path: Path | str,
     output_dir: Path | str,
     *,
+    flaky_summaries: list,          # list[FlakySummary] — used for before fail rates
     before_flaky: int,
     before_pass_rate: float,
     after_flaky: int,
@@ -41,23 +42,28 @@ def write_report(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fixed = [r for r in patch_results if r.status == "fixed"]
-    suggestion = [r for r in patch_results if r.status == "suggestion_only"]
 
-    # Time-saved formula
-    # avg fail rate across flaky tests before patching
-    if patch_results:
-        avg_fail_rate = sum(
-            (r.verify_runs - r.verify_passes) / r.verify_runs
-            if r.verify_runs > 0 else 0.3
-            for r in patch_results
-        ) / len(patch_results)
-    else:
-        avg_fail_rate = 0.3
+    # Build a lookup from node_id -> FlakySummary for the before-fail rates
+    summary_map = {s.node_id: s for s in flaky_summaries}
 
-    ci_time_saved = (
-        len(fixed) * ci_runs_per_day * avg_fail_rate * minutes_per_rerun * 22
+    # CI time saved: sum over each fixed test of its before-detection fail rate
+    # Formula: sum_fixed(before_fail_rate) x ci_runs_per_day x minutes_per_rerun x 22
+    ci_time_saved = sum(
+        (summary_map[r.node_id].fail_count / summary_map[r.node_id].total_runs
+         if r.node_id in summary_map and summary_map[r.node_id].total_runs > 0
+         else 0.3)
+        * ci_runs_per_day * minutes_per_rerun * 22
+        for r in fixed
     )
-    dev_time_saved = len(fixed) * 4 + len(suggestion) * 1
+    # avg fail rate shown in formula (for display only)
+    if fixed and summary_map:
+        avg_fail_rate = sum(
+            summary_map[r.node_id].fail_count / summary_map[r.node_id].total_runs
+            for r in fixed
+            if r.node_id in summary_map and summary_map[r.node_id].total_runs > 0
+        ) / len(fixed)
+    else:
+        avg_fail_rate = 0.0
 
     report_path = output_dir / "report.html"
     report_path.write_text(
@@ -73,11 +79,9 @@ def write_report(
             ci_runs_per_day=ci_runs_per_day,
             minutes_per_rerun=minutes_per_rerun,
             ci_time_saved=ci_time_saved,
-            dev_time_saved=dev_time_saved,
             avg_fail_rate=avg_fail_rate,
             dry_run=dry_run,
             fixed_count=len(fixed),
-            suggestion_count=len(suggestion),
         ),
         encoding="utf-8",
     )
@@ -110,11 +114,9 @@ def _render(
     ci_runs_per_day: int,
     minutes_per_rerun: int,
     ci_time_saved: float,
-    dev_time_saved: float,
     avg_fail_rate: float,
     dry_run: bool,
     fixed_count: int,
-    suggestion_count: int,
 ) -> str:
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -123,11 +125,10 @@ def _render(
     formula_html = f"""
         <div class="formula-box">
           <div class="formula-title">Time Saved Formula</div>
-          <code>CI time saved/month = fixed_tests &times; ci_runs_per_day &times; avg_fail_rate &times; minutes_per_rerun &times; 22 working_days</code>
+          <code>CI time saved/month = &sum;<sub>fixed</sub>(before_fail_rate) &times; ci_runs_per_day &times; minutes_per_rerun &times; 22 working_days</code>
           <br>
-          <code>= {fixed_count} &times; {ci_runs_per_day} &times; {avg_fail_rate:.0%} &times; {minutes_per_rerun} &times; 22 = <strong>{ci_time_saved:.0f} minutes ({ci_time_saved/60:.1f} hrs)</strong></code>
-          <br><br>
-          <code>Developer time saved = (fixed &times; 4h) + (suggestions &times; 1h) = ({fixed_count} &times; 4) + ({suggestion_count} &times; 1) = <strong>{dev_time_saved:.0f} hrs</strong></code>
+          <code>= avg fail rate {avg_fail_rate:.0%} &times; {fixed_count} fixed tests &times; {ci_runs_per_day} &times; {minutes_per_rerun} min &times; 22 = <strong>{ci_time_saved:.0f} minutes ({ci_time_saved/60:.1f} hrs)</strong></code>
+          <br><small style="color:#64748b">Each fixed test uses its own before-detection fail rate; avg shown above for illustration.</small>
         </div>"""
 
     dry_banner = '<div class="dry-banner">[DRY RUN] Bob diagnosis and patching were skipped.</div>' if dry_run else ""

@@ -133,19 +133,19 @@ def _patch_one(
             diff_path=dr.diff_path,
         )
 
-    # -- Back up originals ---------------------------------------------------
-    backups: dict[str, str] = {}
+    # -- Back up originals (byte-identical, preserves line endings) ----------
+    backups: dict[str, bytes] = {}
     for rel_path in dr.new_contents:
         original = project_path / rel_path
         if original.is_file():
-            backups[rel_path] = original.read_text(encoding="utf-8")
+            backups[rel_path] = original.read_bytes()
 
     # -- Apply patch ---------------------------------------------------------
     try:
         for rel_path, new_text in dr.new_contents.items():
             dest = project_path / rel_path
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(new_text, encoding="utf-8")
+            dest.write_bytes(new_text.encode("utf-8"))
     except OSError as exc:
         _restore(backups, project_path)
         return PatchResult(
@@ -253,10 +253,10 @@ def _run_one_verify(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _restore(backups: dict[str, str], project_path: Path) -> None:
-    """Write backup content back to disk."""
+def _restore(backups: dict[str, bytes], project_path: Path) -> None:
+    """Restore original file bytes exactly as they were before patching."""
     for rel_path, content in backups.items():
         try:
-            (project_path / rel_path).write_text(content, encoding="utf-8")
+            (project_path / rel_path).write_bytes(content)
         except OSError:
             pass
