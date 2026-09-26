@@ -1,20 +1,20 @@
 """
-flakehunter/cli.py — entry point for the FlakeHunter CLI.
+flakehunter/cli.py -- entry point for the FlakeHunter CLI.
 
 Commands
 --------
-  flakehunter run <project_path>   detect flaky tests, scan for hints
+  flakehunter run <project_path>   detect, diagnose, and fix flaky tests
   flakehunter reset-demo           restore demo_app from demo_originals/
 """
 
 from __future__ import annotations
 
 import shutil
-import sys
 from pathlib import Path
 
 import click
 
+from flakehunter.diagnoser import diagnose
 from flakehunter.runner import run_suite
 from flakehunter.scanner import scan
 
@@ -166,11 +166,46 @@ def run(
             f"{fail_str:>{col_fail+9}}  {_yellow(hints) if hints != _dim('(none)') else hints}"
         )
 
-    # ── Placeholder for next phases ──────────────────────────────────────────
+    # ── Phase 3: diagnose ────────────────────────────────────────────────────
     click.echo()
+    click.echo(_bold("Phase 3 - Diagnosis & patch generation"))
+
+    if dry_run:
+        click.echo(_yellow("  [!] --dry-run: skipping Bob calls.\n"))
+        diagnosis_results = diagnose(
+            flaky, hints_map, project,
+            workers=workers, max_cost=max_cost,
+            dry_run=True, output_dir=output,
+        )
+    else:
+        click.echo(
+            f"  Spawning up to {workers} parallel Bob subprocess(es) "
+            f"(max ${max_cost} each) ...\n"
+        )
+        diagnosis_results = diagnose(
+            flaky, hints_map, project,
+            workers=workers, max_cost=max_cost,
+            dry_run=False, output_dir=output,
+        )
+
+    # Print per-test diagnosis summary
+    for r in sorted(diagnosis_results, key=lambda x: x.node_id):
+        status_str = {
+            "dry-run": _dim("[dry-run]"),
+            "error":   _red("[error]"),
+        }.get(r.root_cause, _cyan(f"[{r.root_cause}]"))
+
+        diff_info = _dim("no diff") if not r.diff_text else _green(f"diff saved -> {r.diff_path.name}")
+        click.echo(f"  {r.node_id}")
+        click.echo(f"    root cause : {status_str}")
+        if r.explanation:
+            click.echo(f"    explanation: {r.explanation}")
+        click.echo(f"    diff       : {diff_info}")
+        click.echo()
+
     click.echo(_dim("-" * 60))
     click.echo(
-        _yellow("  [i]  Diagnose / patch / report not implemented yet.")
+        _yellow("  [i]  Patch / verify / report not implemented yet.")
     )
     click.echo(_dim("-" * 60))
     click.echo()
