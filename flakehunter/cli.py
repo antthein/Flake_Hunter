@@ -3,7 +3,7 @@ flakehunter/cli.py -- entry point for the FlakeHunter CLI.
 
 Commands
 --------
-  flakehunter run <project_path>   detect, diagnose, and fix flaky tests
+  flakehunter run <project_path>   detect, diagnose, fix, and report flaky tests
   flakehunter reset-demo           restore demo_app from demo_originals/
 """
 
@@ -15,11 +15,13 @@ from pathlib import Path
 import click
 
 from flakehunter.diagnoser import diagnose
-from flakehunter.runner import run_suite
+from flakehunter.patcher import patch_and_verify, run_after_suite
+from flakehunter.reporter import write_report
+from flakehunter.runner import FlakySummary, _single_run
 from flakehunter.scanner import scan
 
 
-# ── colour palette ──────────────────────────────────────────────────────────
+# ── colour helpers ───────────────────────────────────────────────────────────
 def _red(s: str) -> str:    return click.style(s, fg="red",    bold=True)
 def _yellow(s: str) -> str: return click.style(s, fg="yellow", bold=True)
 def _green(s: str) -> str:  return click.style(s, fg="green",  bold=True)
@@ -32,20 +34,21 @@ def _bold(s: str) -> str:   return click.style(s, bold=True)
 
 @click.group()
 def main() -> None:
-    """FlakeHunter — find, diagnose, and fix flaky pytest tests."""
+    """FlakeHunter -- find, diagnose, and fix flaky pytest tests."""
 
 
 # ── run ──────────────────────────────────────────────────────────────────────
 
 @main.command()
 @click.argument("project_path", type=click.Path(exists=True, file_okay=False))
-@click.option("--runs",             default=20,    show_default=True, help="Detection re-run passes.")
-@click.option("--workers",          default=4,     show_default=True, help="Parallel Bob subprocesses.")
-@click.option("--max-cost",         default=1.0,   show_default=True, help="Per-Bob-call cost cap ($).")
-@click.option("--dry-run",          is_flag=True,  help="Skip Bob calls; report hints only.")
-@click.option("--output",           default="reports", show_default=True, type=click.Path(), help="Report output directory.")
-@click.option("--ci-runs-per-day",  default=10,    show_default=True, help="CI runs/day (time-saved formula).")
-@click.option("--minutes-per-rerun",default=5,     show_default=True, help="Minutes per re-run (time-saved formula).")
+@click.option("--runs",              default=20,    show_default=True, help="Detection re-run passes.")
+@click.option("--workers",           default=4,     show_default=True, help="Parallel Bob subprocesses.")
+@click.option("--max-cost",          default=1.0,   show_default=True, help="Per-Bob-call cost cap ($).")
+@click.option("--dry-run",           is_flag=True,  help="Skip Bob calls; still produce a report.")
+@click.option("--output",            default="reports", show_default=True, type=click.Path(), help="Report output directory.")
+@click.option("--verify-runs",       default=50,    show_default=True, help="Pytest passes for patch verification.")
+@click.option("--ci-runs-per-day",   default=10,    show_default=True, help="CI runs/day (time-saved formula).")
+@click.option("--minutes-per-rerun", default=5,     show_default=True, help="Minutes per CI re-run (time-saved formula).")
 def run(
     project_path: str,
     runs: int,
@@ -53,46 +56,46 @@ def run(
     max_cost: float,
     dry_run: bool,
     output: str,
+    verify_runs: int,
     ci_runs_per_day: int,
     minutes_per_rerun: int,
 ) -> None:
-    """Detect flaky tests in PROJECT_PATH and (eventually) fix them."""
+    """Detect, diagnose, and fix flaky tests in PROJECT_PATH."""
 
     project = Path(project_path).resolve()
+    output_dir = Path(output)
+
     click.echo()
     click.echo(_bold("===  FlakeHunter  ==="))
     click.echo(f"  Project : {_cyan(str(project))}")
-    click.echo(f"  Runs    : {runs}   Workers: {workers}   Max-cost: ${max_cost}")
+    click.echo(f"  Runs    : {runs}   Workers: {workers}   Max-cost: ${max_cost}   Verify: {verify_runs}x")
     if dry_run:
         click.echo("  " + _yellow("[!] --dry-run  (Bob calls will be skipped)"))
     click.echo()
 
-    # ── Phase 1: detect ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 1: Re-run detection
+    # ─────────────────────────────────────────────────────────────────────────
     click.echo(_bold("Phase 1 - Re-run detection"))
+
+    counts: dict[str, dict[str, int]] = {}
+    clean_runs = 0
+    successful_runs = 0
 
     with click.progressbar(
         length=runs,
         label="  Running suite",
         bar_template="  %(label)s  %(bar)s  %(info)s",
-        fill_char=click.style("█", fg="cyan"),
-        empty_char=click.style("░", dim=True),
+        fill_char=click.style("#", fg="cyan"),
+        empty_char=click.style(".", dim=True),
         width=40,
     ) as bar:
-        # We need per-run progress, so call _single_run ourselves via a
-        # wrapper that ticks the bar after each run.
-        from flakehunter.runner import _single_run, FlakySummary
-
-        counts: dict[str, dict[str, int]] = {}
-        clean_runs = 0
-        successful_runs = 0
-
         for i in range(runs):
             outcomes, skipped = _single_run(project)
             bar.update(1)
             if skipped:
                 click.echo(
-                    f"\n  {_yellow('[!]')}  Run {i + 1} produced no report "
-                    "(collection error?), skipping.",
+                    f"\n  {_yellow('[!]')} Run {i + 1} produced no report, skipping.",
                     err=True,
                 )
                 continue
@@ -109,8 +112,8 @@ def run(
             if run_all_passed:
                 clean_runs += 1
 
-    suite_pass_rate = clean_runs / successful_runs if successful_runs > 0 else 0.0
-    flaky = [
+    before_pass_rate = clean_runs / successful_runs if successful_runs > 0 else 0.0
+    flaky: list[FlakySummary] = [
         FlakySummary(
             node_id=nid,
             pass_count=v["pass"],
@@ -121,94 +124,171 @@ def run(
         if v["pass"] > 0 and v["fail"] > 0
     ]
 
-    clean_count = round(suite_pass_rate * successful_runs)
+    clean_count = round(before_pass_rate * successful_runs)
     click.echo(
         f"\n  Suite pass rate (all green): "
-        f"{_green(f'{suite_pass_rate:.0%}')}  "
+        f"{_green(f'{before_pass_rate:.0%}')}  "
         f"{_dim(f'({clean_count}/{successful_runs} runs)')}"
     )
 
     if not flaky:
         click.echo("\n" + _green("[OK]  No flaky tests detected."))
+        # Still produce an empty report
+        _write_empty_report(output_dir, project, before_pass_rate, runs, ci_runs_per_day, minutes_per_rerun)
         return
 
-    click.echo(
-        f"  Flaky tests found: {_red(str(len(flaky)))}\n"
-    )
+    click.echo(f"  Flaky tests found: {_red(str(len(flaky)))}\n")
 
-    # ── Phase 2: hints ───────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 2: Static hint scan
+    # ─────────────────────────────────────────────────────────────────────────
     click.echo(_bold("Phase 2 - Static hint scan"))
     hints_map = scan([s.node_id for s in flaky], project)
-    click.echo(f"  Scanned {len(flaky)} test file(s).\n")
+    click.echo(f"  Scanned {len(flaky)} test file(s).")
 
-    # ── Summary table ────────────────────────────────────────────────────────
-    click.echo(_bold("Flaky tests detected"))
+    # Print detection table
     click.echo()
-
-    # Column widths
-    col_test  = max(len(s.node_id) for s in flaky)
-    col_pass  = 6
-    col_fail  = 6
-    col_hints = 30
-
-    header = (
-        f"  {'TEST':<{col_test}}  {'PASS':>{col_pass}}  {'FAIL':>{col_fail}}  HINTS"
-    )
-    click.echo(_dim(header))
-    click.echo(_dim("  " + "-" * (col_test + col_pass + col_fail + col_hints + 8)))
-
+    col_w = max(len(s.node_id) for s in flaky)
+    click.echo(_dim(f"  {'TEST':<{col_w}}  {'PASS':>6}  {'FAIL':>6}  HINTS"))
+    click.echo(_dim("  " + "-" * (col_w + 30)))
     for s in sorted(flaky, key=lambda x: x.fail_count, reverse=True):
-        hints = ", ".join(hints_map.get(s.node_id, [])) or _dim("(none)")
-        fail_str = _red(f"{s.fail_count}/{s.total_runs}")
-        pass_str = _green(f"{s.pass_count}/{s.total_runs}")
+        hints_str = ", ".join(hints_map.get(s.node_id, [])) or "(none)"
         click.echo(
-            f"  {s.node_id:<{col_test}}  {pass_str:>{col_pass+9}}  "
-            f"{fail_str:>{col_fail+9}}  {_yellow(hints) if hints != _dim('(none)') else hints}"
+            f"  {s.node_id:<{col_w}}  "
+            f"{_green(f'{s.pass_count}/{s.total_runs}'):>15}  "
+            f"{_red(f'{s.fail_count}/{s.total_runs}'):>14}  "
+            f"{_yellow(hints_str)}"
         )
-
-    # ── Phase 3: diagnose ────────────────────────────────────────────────────
     click.echo()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 3: Diagnosis (Bob)
+    # ─────────────────────────────────────────────────────────────────────────
     click.echo(_bold("Phase 3 - Diagnosis & patch generation"))
 
     if dry_run:
         click.echo(_yellow("  [!] --dry-run: skipping Bob calls.\n"))
-        diagnosis_results = diagnose(
-            flaky, hints_map, project,
-            workers=workers, max_cost=max_cost,
-            dry_run=True, output_dir=output,
-        )
-    else:
-        click.echo(
-            f"  Spawning up to {workers} parallel Bob subprocess(es) "
-            f"(max ${max_cost} each) ...\n"
-        )
-        diagnosis_results = diagnose(
-            flaky, hints_map, project,
-            workers=workers, max_cost=max_cost,
-            dry_run=False, output_dir=output,
-        )
 
-    # Print per-test diagnosis summary
+    diagnosis_results = diagnose(
+        flaky, hints_map, project,
+        workers=workers,
+        max_cost=max_cost,
+        dry_run=dry_run,
+        output_dir=output_dir,
+    )
+
     for r in sorted(diagnosis_results, key=lambda x: x.node_id):
-        status_str = {
-            "dry-run": _dim("[dry-run]"),
-            "error":   _red("[error]"),
-        }.get(r.root_cause, _cyan(f"[{r.root_cause}]"))
-
-        diff_info = _dim("no diff") if not r.diff_text else _green(f"diff saved -> {r.diff_path.name}")
+        if r.root_cause in ("dry-run",):
+            status_str = _dim("[dry-run]")
+        elif r.root_cause == "error":
+            status_str = _red("[error]")
+        else:
+            status_str = _cyan(f"[{r.root_cause}]")
+        diff_info = _dim("no diff") if not r.diff_text else _green(f"diff -> {r.diff_path.name if r.diff_path else 'patch'}")
         click.echo(f"  {r.node_id}")
-        click.echo(f"    root cause : {status_str}")
+        click.echo(f"    root cause  : {status_str}")
         if r.explanation:
-            click.echo(f"    explanation: {r.explanation}")
-        click.echo(f"    diff       : {diff_info}")
+            click.echo(f"    explanation : {r.explanation[:120]}")
+        click.echo(f"    diff        : {diff_info}")
         click.echo()
 
-    click.echo(_dim("-" * 60))
-    click.echo(
-        _yellow("  [i]  Patch / verify / report not implemented yet.")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 4: Patch & verify
+    # ─────────────────────────────────────────────────────────────────────────
+    click.echo(_bold("Phase 4 - Patch & verify"))
+
+    if dry_run:
+        click.echo(_yellow("  [!] --dry-run: skipping patch/verify.\n"))
+        patch_results = patch_and_verify(
+            diagnosis_results, project,
+            verify_runs=0,
+            workers=workers,
+        )
+        after_pass_rate = before_pass_rate
+        after_flaky_count = len(flaky)
+    else:
+        click.echo(f"  Verifying patches ({verify_runs} runs each, whole-file, random order) ...\n")
+        patch_results = patch_and_verify(
+            diagnosis_results, project,
+            verify_runs=verify_runs,
+            workers=workers,
+        )
+
+        # Print per-test result
+        for pr in sorted(patch_results, key=lambda x: x.node_id):
+            icon = {
+                "fixed":           _green("[FIXED]"),
+                "suggestion_only": _yellow("[SUGGESTION]"),
+                "patch_failed":    _red("[PATCH FAILED]"),
+                "no_patch":        _dim("[NO PATCH]"),
+                "dry-run":         _dim("[DRY RUN]"),
+            }.get(pr.status, _dim(f"[{pr.status}]"))
+            verify_str = f"{pr.verify_passes}/{pr.verify_runs}" if pr.verify_runs > 0 else "n/a"
+            click.echo(f"  {pr.node_id}")
+            click.echo(f"    {icon}  verify: {verify_str}")
+            click.echo()
+
+        # After suite
+        click.echo(_bold("Phase 5 - After-patch suite run"))
+        click.echo(f"  Re-running suite ({runs} passes) to measure improvement ...\n")
+        after_pass_rate, after_flaky_count = run_after_suite(project, runs=runs)
+
+        fixed_count = sum(1 for pr in patch_results if pr.status == "fixed")
+        click.echo(
+            f"  Suite pass rate after : {_green(f'{after_pass_rate:.0%}')}  "
+            f"(was {before_pass_rate:.0%})"
+        )
+        click.echo(
+            f"  Flaky tests remaining : "
+            f"{_green(str(after_flaky_count)) if after_flaky_count == 0 else _yellow(str(after_flaky_count))}  "
+            f"(was {len(flaky)})"
+        )
+        click.echo(f"  Fixed : {_green(str(fixed_count))}\n")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 6: Report
+    # ─────────────────────────────────────────────────────────────────────────
+    click.echo(_bold("Phase 6 - Report"))
+    report_path = write_report(
+        patch_results=patch_results,
+        hints_map=hints_map,
+        project_path=project,
+        output_dir=output_dir,
+        before_flaky=len(flaky),
+        before_pass_rate=before_pass_rate,
+        after_flaky=after_flaky_count,
+        after_pass_rate=after_pass_rate,
+        detection_runs=successful_runs,
+        ci_runs_per_day=ci_runs_per_day,
+        minutes_per_rerun=minutes_per_rerun,
+        dry_run=dry_run,
     )
-    click.echo(_dim("-" * 60))
-    click.echo()
+    click.echo(f"  {_green('[OK]')} Report written to: {_cyan(str(report_path))}\n")
+
+
+def _write_empty_report(
+    output_dir: Path,
+    project: Path,
+    pass_rate: float,
+    runs: int,
+    ci_runs_per_day: int,
+    minutes_per_rerun: int,
+) -> None:
+    """Write a minimal report when no flaky tests were found."""
+    write_report(
+        patch_results=[],
+        hints_map={},
+        project_path=project,
+        output_dir=output_dir,
+        before_flaky=0,
+        before_pass_rate=pass_rate,
+        after_flaky=0,
+        after_pass_rate=pass_rate,
+        detection_runs=runs,
+        ci_runs_per_day=ci_runs_per_day,
+        minutes_per_rerun=minutes_per_rerun,
+        dry_run=False,
+    )
 
 
 # ── reset-demo ───────────────────────────────────────────────────────────────
@@ -217,9 +297,8 @@ def run(
 def reset_demo() -> None:
     """Restore demo_app/ to its original flaky state from demo_originals/."""
 
-    # Locate demo_originals/ relative to this file's package root
-    here = Path(__file__).resolve().parent       # flakehunter/
-    repo_root = here.parent                       # project root
+    here = Path(__file__).resolve().parent
+    repo_root = here.parent
     originals = repo_root / "demo_originals"
     demo_app  = repo_root / "demo_app"
 
@@ -229,13 +308,10 @@ def reset_demo() -> None:
             "Are you running from the FlakeHunter repo?"
         )
 
-    # Restore app.py
     src_app = originals / "app.py"
-    dst_app = demo_app / "app.py"
     if src_app.is_file():
-        shutil.copy2(src_app, dst_app)
+        shutil.copy2(src_app, demo_app / "app.py")
 
-    # Restore test files
     src_tests = originals / "tests"
     dst_tests = demo_app / "tests"
     dst_tests.mkdir(exist_ok=True)
