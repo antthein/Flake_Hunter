@@ -56,6 +56,45 @@ class DiagnosisResult:
 # Public API
 # ---------------------------------------------------------------------------
 
+def load_replay(replay_path: Path | str) -> dict[str, DiagnosisResult]:
+    """
+    Load a previously recorded Bob run from a JSON file.
+
+    Returns a dict keyed by node_id so diagnose() can look up results.
+    """
+    data = json.loads(Path(replay_path).read_text(encoding="utf-8"))
+    results: dict[str, DiagnosisResult] = {}
+    for entry in data:
+        dr = DiagnosisResult(
+            node_id=entry["node_id"],
+            diff_text=entry.get("diff_text"),
+            root_cause=entry.get("root_cause", "other"),
+            explanation=entry.get("explanation", ""),
+            files_changed=entry.get("files_changed", []),
+            new_contents=entry.get("new_contents", {}),
+        )
+        results[dr.node_id] = dr
+    return results
+
+
+def save_record(results: list[DiagnosisResult], record_path: Path | str) -> None:
+    """Serialize DiagnosisResult list to JSON for future replay."""
+    record_path = Path(record_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    data = [
+        {
+            "node_id": r.node_id,
+            "diff_text": r.diff_text,
+            "root_cause": r.root_cause,
+            "explanation": r.explanation,
+            "files_changed": r.files_changed,
+            "new_contents": r.new_contents,
+        }
+        for r in results
+    ]
+    record_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def diagnose(
     flaky: list[FlakySummary],
     hints_map: dict[str, list[str]],
@@ -65,12 +104,19 @@ def diagnose(
     max_cost: float = 1.0,
     dry_run: bool = False,
     output_dir: Path | str = Path("reports"),
+    record_path: Path | str | None = None,
+    replay_path: Path | str | None = None,
+    progress_cb=None,  # callable(node_id, status_str) for live updates
 ) -> list[DiagnosisResult]:
     """
     Run Bob in parallel (one subprocess per flaky test) and return results.
 
     Each Bob call gets its own temp workspace copy so parallel edits never
     collide.  The real project is never touched during diagnosis.
+
+    record_path: if set, serialize results to this JSON file after running.
+    replay_path: if set, skip Bob entirely and load results from this file.
+    progress_cb: optional callable(node_id, status) called as each result arrives.
     """
     project_path = Path(project_path).resolve()
     output_dir = Path(output_dir)
@@ -87,6 +133,33 @@ def diagnose(
                 explanation="",
                 files_changed=[],
             ))
+        return results
+
+    # ── Replay mode: load saved Bob results, skip actual Bob calls ───────────
+    if replay_path is not None:
+        replay_map = load_replay(replay_path)
+        for summary in flaky:
+            if summary.node_id in replay_map:
+                dr = replay_map[summary.node_id]
+                # Recompute diff_path if diff_text exists
+                results.append(dr)
+            else:
+                results.append(DiagnosisResult(
+                    node_id=summary.node_id,
+                    diff_text=None,
+                    root_cause="error",
+                    explanation=f"node_id not found in replay file: {summary.node_id}",
+                    files_changed=[],
+                ))
+            if progress_cb:
+                progress_cb(summary.node_id, results[-1].root_cause)
+        # Save diffs from replay
+        for result in results:
+            if result.diff_text and not result.diff_path:
+                safe_name = re.sub(r"[^\w\-.]", "_", result.node_id) + ".diff"
+                diff_path = output_dir / safe_name
+                diff_path.write_text(result.diff_text, encoding="utf-8")
+                result.diff_path = diff_path
         return results
 
     bob_exe = shutil.which("bob") or shutil.which("bob.cmd")
@@ -122,6 +195,8 @@ def diagnose(
                     files_changed=[],
                 )
             results.append(result)
+            if progress_cb:
+                progress_cb(node_id, result.root_cause)
 
     # Save diffs and set diff_path
     for result in results:
@@ -130,6 +205,10 @@ def diagnose(
             diff_path = output_dir / safe_name
             diff_path.write_text(result.diff_text, encoding="utf-8")
             result.diff_path = diff_path
+
+    # Record results if requested
+    if record_path is not None:
+        save_record(results, record_path)
 
     return results
 

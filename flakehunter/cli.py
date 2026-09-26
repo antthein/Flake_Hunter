@@ -49,6 +49,8 @@ def main() -> None:
 @click.option("--verify-runs",       default=50,    show_default=True, help="Pytest passes for patch verification.")
 @click.option("--ci-runs-per-day",   default=10,    show_default=True, help="CI runs/day (time-saved formula).")
 @click.option("--minutes-per-rerun", default=5,     show_default=True, help="Minutes per CI re-run (time-saved formula).")
+@click.option("--record",            default=None,  type=click.Path(), help="Save Bob results to this JSON file for later replay.")
+@click.option("--replay-bob",        default=None,  type=click.Path(exists=True), help="Skip Bob; load results from this JSON file.")
 def run(
     project_path: str,
     runs: int,
@@ -59,6 +61,8 @@ def run(
     verify_runs: int,
     ci_runs_per_day: int,
     minutes_per_rerun: int,
+    record: str | None,
+    replay_bob: str | None,
 ) -> None:
     """Detect, diagnose, and fix flaky tests in PROJECT_PATH."""
 
@@ -169,12 +173,16 @@ def run(
     if dry_run:
         click.echo(_yellow("  [!] --dry-run: skipping Bob calls.\n"))
 
+    if replay_bob:
+        click.echo(_cyan(f"  [replay] loading Bob results from: {replay_bob}\n"))
     diagnosis_results = diagnose(
         flaky, hints_map, project,
         workers=workers,
         max_cost=max_cost,
         dry_run=dry_run,
         output_dir=output_dir,
+        record_path=record,
+        replay_path=replay_bob,
     )
 
     for r in sorted(diagnosis_results, key=lambda x: x.node_id):
