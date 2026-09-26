@@ -12,6 +12,9 @@ dependencies = [
 [project.scripts]
 flakehunter = "flakehunter.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["flakehunter*"]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
