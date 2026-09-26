@@ -46,23 +46,26 @@ def run_suite(
     flaky : list[FlakySummary]
         Tests that flipped between pass and fail across the runs.
     suite_pass_rate : float
-        Fraction of runs in which every single test passed (0.0 – 1.0).
+        Fraction of *successful* runs (report parsed, ≥1 test collected) in
+        which every single test passed (0.0 – 1.0).
     """
     project_path = Path(project_path).resolve()
 
     # per-test outcome counters  {node_id: {"pass": int, "fail": int}}
     counts: dict[str, dict[str, int]] = {}
-    clean_runs = 0  # runs where every test passed
+    clean_runs = 0      # successful runs where every test passed
+    successful_runs = 0 # runs that produced a parseable, non-empty report
 
     for i in range(runs):
         if verbose:
             print(f"  run {i + 1}/{runs} ...", end="\r", flush=True)
 
-        outcomes = _single_run(project_path)
-        if not outcomes:
-            # pytest produced no parseable report (collection error etc.) — skip
+        outcomes, skipped = _single_run(project_path)
+        if skipped:
+            print(f"\n  [warning] run {i + 1} produced no report (collection error?), skipping.")
             continue
 
+        successful_runs += 1
         run_all_passed = True
         for node_id, passed in outcomes.items():
             entry = counts.setdefault(node_id, {"pass": 0, "fail": 0})
@@ -78,14 +81,14 @@ def run_suite(
     if verbose:
         print()  # newline after \r progress
 
-    suite_pass_rate = clean_runs / runs if runs > 0 else 0.0
+    suite_pass_rate = clean_runs / successful_runs if successful_runs > 0 else 0.0
 
     flaky: list[FlakySummary] = [
         FlakySummary(
             node_id=nid,
             pass_count=v["pass"],
             fail_count=v["fail"],
-            total_runs=runs,
+            total_runs=successful_runs,
         )
         for nid, v in counts.items()
         if v["pass"] > 0 and v["fail"] > 0
@@ -94,11 +97,13 @@ def run_suite(
     return flaky, suite_pass_rate
 
 
-def _single_run(project_path: Path) -> dict[str, bool]:
+def _single_run(project_path: Path) -> tuple[dict[str, bool], bool]:
     """
-    Run pytest once and return {node_id: passed} for every collected test.
-    node_ids are made relative to project_path.
-    Returns an empty dict if the report cannot be parsed.
+    Run pytest once and return ({node_id: passed}, skipped).
+
+    ``skipped=True`` means the report was missing or unparseable.
+    node_ids are normalised relative to project_path using the report's
+    ``root`` field, so results are stable regardless of the caller's cwd.
     """
     with tempfile.NamedTemporaryFile(
         suffix=".json", delete=False, mode="w"
@@ -124,40 +129,52 @@ def _single_run(project_path: Path) -> dict[str, bool]:
         with open(report_path, encoding="utf-8") as fh:
             report = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        return {}, True
     finally:
         Path(report_path).unlink(missing_ok=True)
 
+    tests = report.get("tests", [])
+    if not tests:
+        return {}, True
+
+    # pytest-json-report includes a "root" key with the absolute rootdir.
+    # Use it to make node_ids relative to project_path regardless of cwd.
+    report_root = Path(report.get("root", str(project_path)))
+
     outcomes: dict[str, bool] = {}
-    for test in report.get("tests", []):
+    for test in tests:
         raw_id: str = test.get("nodeid", "")
-        # Make node_id relative to project_path
-        rel_id = _make_relative(raw_id, project_path)
-        when = test.get("outcome", "")
-        outcomes[rel_id] = (when == "passed")
+        rel_id = _make_relative(raw_id, report_root, project_path)
+        outcomes[rel_id] = (test.get("outcome", "") == "passed")
 
-    return outcomes
+    return outcomes, False
 
 
-def _make_relative(node_id: str, project_path: Path) -> str:
+def _make_relative(node_id: str, report_root: Path, project_path: Path) -> str:
     """
-    Strip the absolute project prefix from a node_id if present.
+    Normalise a pytest node_id to be relative to *project_path*.
 
-    pytest may emit either absolute paths or paths relative to cwd.
-    We want paths relative to project_path for portability.
+    Strategy:
+      1. Split off the ``::test_name`` suffix.
+      2. Resolve the file part against ``report_root`` (the pytest rootdir from
+         the JSON report) to get an absolute path — this works regardless of
+         what the caller's cwd was when FlakeHunter was invoked.
+      3. Make the absolute path relative to ``project_path``.
     """
-    # node_id format: "path/to/file.py::test_name[param]"
     sep = "::"
     if sep in node_id:
         file_part, rest = node_id.split(sep, 1)
     else:
         file_part, rest = node_id, ""
 
+    # Resolve against report_root to get an absolute path, then make it
+    # relative to project_path.
+    abs_path = (report_root / file_part).resolve()
     try:
-        rel = Path(file_part).resolve().relative_to(project_path)
+        rel = abs_path.relative_to(project_path)
         file_part = rel.as_posix()
     except ValueError:
-        # already relative or unresolvable — use as-is
+        # Fallback: strip project_path prefix from string if present
         file_part = Path(file_part).as_posix()
 
     return f"{file_part}{sep}{rest}" if rest else file_part
@@ -178,7 +195,9 @@ def _main() -> None:
     print(f"Running suite {args.runs} times against: {args.project_path}")
     flaky, suite_pass_rate = run_suite(args.project_path, runs=args.runs, verbose=True)
 
-    print(f"\nSuite pass rate (all tests green): {suite_pass_rate:.0%} ({int(suite_pass_rate * args.runs)}/{args.runs} runs)\n")
+    total_runs = flaky[0].total_runs if flaky else args.runs
+    clean = round(suite_pass_rate * total_runs)
+    print(f"\nSuite pass rate (all tests green): {suite_pass_rate:.0%} ({clean}/{total_runs} successful runs)\n")
 
     if not flaky:
         print("No flaky tests detected.")
