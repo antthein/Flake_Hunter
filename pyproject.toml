@@ -1,0 +1,17 @@
+[project]
+name = "flakehunter"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "pytest>=7.0",
+    "pytest-json-report>=1.5",
+    "pytest-randomly>=3.12",
+]
+
+[project.scripts]
+flakehunter = "flakehunter.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
