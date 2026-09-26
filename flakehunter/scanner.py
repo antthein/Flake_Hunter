@@ -33,7 +33,10 @@ def scan(
     """
     Return ``{node_id: [hint, ...]}`` for every node_id in *flaky_node_ids*.
 
-    Scans the test file and any local (same-project) modules it imports.
+    Scans the test file fully, then scans only the bodies of the specific
+    symbols (functions/classes) imported from local modules — not the whole
+    module — to avoid false hints from unrelated code (e.g. module-level
+    imports in app.py that the test never exercises).
     """
     project_path = Path(project_path).resolve()
     result: dict[str, list[str]] = {}
@@ -46,12 +49,12 @@ def scan(
 
         hints: set[str] = set()
 
-        # Scan the test file itself
+        # Scan the test file itself (full walk)
         _scan_file(test_file, hints)
 
-        # Also scan local modules the test imports
-        for mod_path in _local_imports(test_file, project_path):
-            _scan_file(mod_path, hints)
+        # Scan only the imported symbol bodies from local modules
+        for mod_path, symbol_names in _local_imports(test_file, project_path).items():
+            _scan_symbols(mod_path, symbol_names, hints)
 
         result[node_id] = sorted(hints)
 
@@ -76,100 +79,147 @@ def _resolve_file(node_id: str, project_path: Path) -> Path | None:
 
 
 def _scan_file(path: Path, hints: set[str]) -> None:
-    """Walk the AST of *path* and add matching hint labels to *hints*."""
+    """Walk the full AST of *path* and add matching hint labels to *hints*."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (SyntaxError, OSError):
         return
 
     for node in ast.walk(tree):
-
-        # ── imports ──────────────────────────────────────────────────────────
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = (
-                [node.module or ""] if isinstance(node, ast.ImportFrom)
-                else [alias.name for alias in node.names]
-            )
-            for name in names:
-                root = (name or "").split(".")[0]
-                if root == "time":
-                    hints.add("timing")
-                if root == "random":
-                    hints.add("random")
-                if root in _NETWORK_IMPORTS:
-                    hints.add("network")
-
-        # ── function calls ────────────────────────────────────────────────────
-        elif isinstance(node, ast.Call):
-            func_name = _call_name(node)
-            if func_name:
-                # time.sleep(...)
-                if func_name in ("time.sleep", "sleep"):
-                    hints.add("timing")
-                # random.*
-                if func_name.startswith("random.") or func_name == "random":
-                    hints.add("random")
-                # network-ish function names
-                lower = func_name.lower()
-                if any(kw in lower for kw in _NETWORK_NAMES):
-                    hints.add("network")
-
-        # ── raise / except: TimeoutError, ConnectionError … ──────────────────
-        elif isinstance(node, ast.Raise):
-            if node.exc is not None:
-                exc_name = _exc_name(node.exc)
-                if exc_name in _NETWORK_ERRORS:
-                    hints.add("network")
-
-        elif isinstance(node, ast.ExceptHandler):
-            if node.type is not None:
-                exc_name = _exc_name(node.type)
-                if exc_name in _NETWORK_ERRORS:
-                    hints.add("network")
-
-        # ── module-level mutable assignments (list / dict literal) ───────────
-        elif isinstance(node, ast.Assign):
-            # Only flag top-level assignments (depth 1 in the module body)
-            if _is_module_level(node, tree):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and isinstance(
-                        node.value, (ast.List, ast.Dict)
-                    ):
-                        hints.add("shared-state")
+        _check_node(node, tree, hints, module_level=True)
 
 
-def _local_imports(test_file: Path, project_path: Path) -> list[Path]:
+def _check_node(
+    node: ast.AST,
+    tree: ast.Module,
+    hints: set[str],
+    *,
+    module_level: bool,
+) -> None:
+    """Inspect a single AST node and add any matching hints."""
+
+    # ── imports ───────────────────────────────────────────────────────────
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        names = (
+            [node.module or ""] if isinstance(node, ast.ImportFrom)
+            else [alias.name for alias in node.names]
+        )
+        for name in names:
+            root = (name or "").split(".")[0]
+            if root == "time":
+                hints.add("timing")
+            if root == "random":
+                hints.add("random")
+            if root in _NETWORK_IMPORTS:
+                hints.add("network")
+
+    # ── function calls ────────────────────────────────────────────────────
+    elif isinstance(node, ast.Call):
+        func_name = _call_name(node)
+        if func_name:
+            if func_name in ("time.sleep", "sleep"):
+                hints.add("timing")
+            if func_name.startswith("random.") or func_name == "random":
+                hints.add("random")
+            lower = func_name.lower()
+            if any(kw in lower for kw in _NETWORK_NAMES):
+                hints.add("network")
+
+    # ── raise / except: TimeoutError, ConnectionError … ──────────────────
+    elif isinstance(node, ast.Raise):
+        if node.exc is not None:
+            if _exc_name(node.exc) in _NETWORK_ERRORS:
+                hints.add("network")
+
+    elif isinstance(node, ast.ExceptHandler):
+        if node.type is not None:
+            if _exc_name(node.type) in _NETWORK_ERRORS:
+                hints.add("network")
+
+    # ── module-level mutable assignments (list / dict literal) ───────────
+    elif module_level and isinstance(node, ast.Assign):
+        if _is_module_level(node, tree):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and isinstance(
+                    node.value, (ast.List, ast.Dict)
+                ):
+                    hints.add("shared-state")
+
+
+def _local_imports(test_file: Path, project_path: Path) -> dict[Path, set[str]]:
     """
-    Return paths of local (same-project) modules imported by *test_file*.
+    Return ``{module_path: {symbol_name, ...}}`` for local modules imported by
+    *test_file*.
 
-    Only resolves simple ``import foo`` / ``from foo import bar`` where
-    ``foo.py`` exists in the same directory or project root.
+    For ``from app import add_stock, compute`` this yields
+    ``{Path(".../app.py"): {"add_stock", "compute"}}``.
+    For ``import app`` (bare module import) the symbol set is empty, which
+    signals that the whole module body should be scanned.
+
+    Only resolves modules whose ``.py`` file exists in the same directory as
+    the test or at the project root.
     """
     try:
         tree = ast.parse(test_file.read_text(encoding="utf-8"))
     except (SyntaxError, OSError):
-        return []
+        return {}
 
-    candidates: list[Path] = []
+    result: dict[Path, set[str]] = {}
     search_dirs = [test_file.parent, project_path]
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            mod = (
-                node.module
-                if isinstance(node, ast.ImportFrom)
-                else next((a.name for a in node.names), None)
-            )
-            if not mod:
-                continue
-            root_mod = mod.split(".")[0]
-            for d in search_dirs:
-                candidate = (d / f"{root_mod}.py").resolve()
-                if candidate.is_file() and candidate != test_file:
-                    candidates.append(candidate)
-                    break
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
 
-    return candidates
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            # collect the names being imported: `from app import foo, bar`
+            symbols = {alias.name for alias in node.names if alias.name != "*"}
+        else:
+            mod = next((a.name for a in node.names), "")
+            symbols = set()  # bare `import app` — no specific symbols
+
+        root_mod = mod.split(".")[0]
+        if not root_mod:
+            continue
+
+        for d in search_dirs:
+            candidate = (d / f"{root_mod}.py").resolve()
+            if candidate.is_file() and candidate != test_file:
+                entry = result.setdefault(candidate, set())
+                entry.update(symbols)
+                break
+
+    return result
+
+
+def _scan_symbols(mod_path: Path, symbol_names: set[str], hints: set[str]) -> None:
+    """
+    Scan only the bodies of *symbol_names* in *mod_path*.
+
+    If *symbol_names* is empty (bare ``import mod``), falls back to scanning
+    the whole file.
+    """
+    if not symbol_names:
+        _scan_file(mod_path, hints)
+        return
+
+    try:
+        tree = ast.parse(mod_path.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError):
+        return
+
+    for node in tree.body:
+        name = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+        elif isinstance(node, ast.ClassDef):
+            name = node.name
+
+        if name in symbol_names:
+            # Walk only this top-level definition's subtree
+            for child in ast.walk(node):
+                _check_node(child, tree, hints, module_level=False)
 
 
 def _call_name(node: ast.Call) -> str | None:
@@ -189,7 +239,16 @@ def _call_name(node: ast.Call) -> str | None:
 
 
 def _exc_name(node: ast.expr) -> str:
-    """Extract the bare exception class name from a Name or Attribute node."""
+    """
+    Extract the bare exception class name from a node.
+
+    Handles:
+      - ``Name``           : ``TimeoutError``
+      - ``Attribute``      : ``socket.timeout``
+      - ``Call``           : ``TimeoutError("msg")``  ← unwrap to the func
+    """
+    if isinstance(node, ast.Call):
+        return _exc_name(node.func)
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
