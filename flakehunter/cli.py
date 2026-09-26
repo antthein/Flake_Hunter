@@ -301,6 +301,17 @@ def _write_empty_report(
     )
 
 
+# ── serve ────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Interface to bind.")
+@click.option("--port", default=8000, show_default=True, type=int, help="Port to listen on.")
+def serve(host: str, port: int) -> None:
+    """Start the FlakeHunter web UI (mode from env FLAKEHUNTER_MODE: demo | live)."""
+    from flakehunter.web import serve as run_server
+    run_server(host=host, port=port)
+
+
 # ── reset-demo ───────────────────────────────────────────────────────────────
 
 @main.command("reset-demo")

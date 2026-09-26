@@ -106,7 +106,7 @@ def diagnose(
     output_dir: Path | str = Path("reports"),
     record_path: Path | str | None = None,
     replay_path: Path | str | None = None,
-    progress_cb=None,  # callable(node_id, status_str) for live updates
+    progress_cb=None,  # callable(node_id, status_str, DiagnosisResult) for live updates
 ) -> list[DiagnosisResult]:
     """
     Run Bob in parallel (one subprocess per flaky test) and return results.
@@ -116,7 +116,7 @@ def diagnose(
 
     record_path: if set, serialize results to this JSON file after running.
     replay_path: if set, skip Bob entirely and load results from this file.
-    progress_cb: optional callable(node_id, status) called as each result arrives.
+    progress_cb: optional callable(node_id, status, result) called as each result arrives.
     """
     project_path = Path(project_path).resolve()
     output_dir = Path(output_dir)
@@ -152,7 +152,7 @@ def diagnose(
                     files_changed=[],
                 ))
             if progress_cb:
-                progress_cb(summary.node_id, results[-1].root_cause)
+                progress_cb(summary.node_id, results[-1].root_cause, results[-1])
         # Save diffs from replay
         for result in results:
             if result.diff_text and not result.diff_path:
@@ -196,7 +196,7 @@ def diagnose(
                 )
             results.append(result)
             if progress_cb:
-                progress_cb(node_id, result.root_cause)
+                progress_cb(node_id, result.root_cause, result)
 
     # Save diffs and set diff_path
     for result in results:

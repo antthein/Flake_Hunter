@@ -54,6 +54,7 @@ def patch_and_verify(
     *,
     verify_runs: int = 50,
     workers: int = 4,
+    progress_cb=None,  # callable(node_id, runs_done, passes, verify_runs) for live updates
 ) -> list[PatchResult]:
     """
     Apply each diagnosis patch, verify with pytest, revert on failure.
@@ -73,6 +74,7 @@ def patch_and_verify(
                 dr=dr,
                 project_path=project_path,
                 verify_runs=verify_runs,
+                progress_cb=progress_cb,
             )
             futures[future] = dr.node_id
 
@@ -117,6 +119,7 @@ def _patch_one(
     dr: DiagnosisResult,
     project_path: Path,
     verify_runs: int,
+    progress_cb=None,
 ) -> PatchResult:
     """Apply one patch, verify, revert if needed. Thread-safe (different files)."""
 
@@ -171,7 +174,9 @@ def _patch_one(
         runs_done += 1
         if outcome is True:
             passes += 1
-        elif outcome is False:
+        if progress_cb:
+            progress_cb(dr.node_id, runs_done, passes, verify_runs)
+        if outcome is False:
             break   # fail fast on first failure
 
     all_passed = (passes == verify_runs)

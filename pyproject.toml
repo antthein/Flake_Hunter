@@ -7,10 +7,15 @@ dependencies = [
     "pytest>=7.0",
     "pytest-json-report>=1.5",
     "pytest-randomly>=3.12",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [project.scripts]
 flakehunter = "flakehunter.cli:main"
+
+[tool.setuptools.package-data]
+flakehunter = ["static/*"]
 
 [tool.setuptools.packages.find]
 include = ["flakehunter*"]
