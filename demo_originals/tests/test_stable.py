@@ -1,8 +1,4 @@
-"""
-demo_app/tests/test_stable.py — deterministic tests that must never be flagged as flaky.
-
-These tests prove FlakeHunter doesn't false-positive on well-written tests.
-"""
+"""Stable tests for core shop utilities."""
 
 import sys
 import os

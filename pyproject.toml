@@ -15,6 +15,9 @@ flakehunter = "flakehunter.cli:main"
 [tool.setuptools.packages.find]
 include = ["flakehunter*"]
 
+[tool.pytest.ini_options]
+norecursedirs = ["demo_originals", ".git", "reports", "*.egg-info"]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
