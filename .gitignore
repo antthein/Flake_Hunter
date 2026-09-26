@@ -10,3 +10,4 @@ build/
 reports/
 *.diff
 .json-report
+preflight.json

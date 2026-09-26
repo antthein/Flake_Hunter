@@ -1,0 +1,8 @@
+.git
+.pytest_cache
+**/__pycache__
+*.egg-info
+reports
+.venv
+venv
+preflight.json
