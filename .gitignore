@@ -12,3 +12,6 @@ reports/
 .json-report
 preflight.json
 SUBMISSION_DRAFT.md
+
+# Raw Bob task exports can contain the API key - share only redacted copies
+Bob Text history/
