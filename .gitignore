@@ -11,3 +11,4 @@ reports/
 *.diff
 .json-report
 preflight.json
+SUBMISSION_DRAFT.md
