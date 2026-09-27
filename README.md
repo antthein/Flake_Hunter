@@ -33,7 +33,7 @@ Bob identified shared state leaking between tests, a random sleep exceeding an S
 
 ## Try it
 
-**Web demo (hosted):** see the Application URL in the submission. It runs in **demo mode**: detection, patch application and verification run live on the server, while Bob's diagnoses are replayed from [`demo_data/bob_run.json`](demo_data/bob_run.json), a recording of the real IBM Bob 2.0 run above. That way the public page needs no API key.
+**Web demo (hosted):** [flake-hunter.onrender.com](https://flake-hunter.onrender.com). The free server sleeps when idle, so the first visit can take about a minute. It runs in **demo mode**: detection, patch application and verification run live on the server, while Bob's diagnoses are replayed from [`demo_data/bob_run.json`](demo_data/bob_run.json), a recording of the real IBM Bob 2.0 run above. That way the public page needs no API key.
 
 **Locally:**
 
@@ -47,6 +47,56 @@ flakehunter serve                                       # web UI on http://127.0
 ```
 
 Set `FLAKEHUNTER_MODE=live` before `flakehunter serve` to call IBM Bob for real from the web UI.
+
+## Use it on your own project
+
+FlakeHunter is free and open source. **You bring your own IBM Bob account**: Bob usage is billed to your Bob plan, and no key is ever stored in this repository.
+
+**1. Install FlakeHunter** in the same Python environment as your project, so it can run your tests:
+
+```bash
+pip install git+https://github.com/antthein/Flake_Hunter.git
+```
+
+**2. Find flaky tests. No Bob account is needed for this.**
+
+```bash
+flakehunter run . --dry-run
+```
+
+This detects flaky tests (pass/fail rates over repeated random-order runs), adds hints (timing, random, network, shared-state) and writes a report, without diagnosis or fixes.
+
+**3. Let IBM Bob diagnose and fix them.** This needs your own Bob access:
+
+1. Get IBM Bob at [bob.ibm.com](https://bob.ibm.com) and install [Bob Shell](https://bob.ibm.com/docs/shell/getting-started/install-and-setup), so the `bob` command works.
+2. Create an API key with scope **Inference** in the Bob web portal.
+3. Put the key in your environment, never in a file inside the project:
+
+   ```powershell
+   $env:BOB_API_KEY = "<your key>"      # Windows PowerShell, current terminal only
+   ```
+
+   ```bash
+   export BOB_API_KEY="<your key>"      # macOS / Linux
+   ```
+
+4. Run FlakeHunter with a cost cap for each Bob call:
+
+   ```bash
+   flakehunter run . --max-cost 0.5
+   ```
+
+FlakeHunter never reads the key itself. It starts `bob run`, and Bob Shell reads `BOB_API_KEY` from the environment.
+
+**In CI** (for example a nightly GitHub Actions job), store the key as a repository secret named `BOB_API_KEY` and expose it to the job as an environment variable. Never commit it.
+
+**Replay mode** (`--replay-bob`) only works for the included demo app, because it replays Bob's recorded answers for those 4 tests. Any other project needs live Bob.
+
+| Command | IBM Bob | Needs a Bob key |
+|---|---|---|
+| `flakehunter run . --dry-run` | not used (detect + hints + report) | no |
+| `flakehunter run demo_app --replay-bob demo_data/bob_run.json` | recorded answers replayed | no |
+| `flakehunter run .` | live diagnosis and fixes | yes, plus Bob credits |
 
 ## Safety by design
 
