@@ -1,5 +1,5 @@
 # FlakeHunter web demo (demo mode: replays a recorded IBM Bob run; detection and
-# verification run live). Works on Hugging Face Spaces (Docker SDK) and any Docker host.
+# verification run live). Works on Render, Hugging Face Spaces or any Docker host (reads $PORT).
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
